@@ -1,0 +1,4 @@
+interface:
+  display_name: "Clean Git Worktrees"
+  short_description: "Audit and prune merged Git branches"
+  default_prompt: "Use $clean-git-worktrees to audit this repo's local branches and worktrees, deleting only clean entries whose GitHub PRs are merged."
