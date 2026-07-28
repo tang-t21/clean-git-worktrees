@@ -37,11 +37,30 @@ Treat a local branch/worktree as auto-deletable only when all of these are true:
 
 The script removes local linked worktrees with `git worktree remove` and removes local branches with `git branch -D`. It never deletes remote branches.
 
+If normal removal fails with `working trees containing submodules cannot be moved or removed`, the script may use `git worktree remove --force` only after the submodule safety audit below passes. Do not treat the presence of `.gitmodules` alone as requiring force removal.
+
 If a merged PR exists but the worktree is dirty, do not delete. Report the dirty summary from the script.
 
 If no GitHub PR is found, do not delete. Report the script's diff summary against the configured base, defaulting to `origin/main`.
 
 If PR lookup fails because `gh` is unavailable or unauthenticated, do not delete. Report the lookup failure and any diff summary available.
+
+## Submodule Worktree Safety
+
+Git 2.34 can reject removal when a linked worktree retains per-worktree submodule metadata under its absolute Git directory, even when `git submodule status` shows uninitialized entries.
+
+When this happens, let the script perform this exact fallback:
+
+1. Recheck the root worktree and every initialized recursive submodule for staged, unstaged, and untracked content.
+2. Recursively inspect submodule Git repositories under `<absolute-git-dir>/modules`.
+3. Refuse force removal if any repository has a stash, an unsupported local ref, a branch or detached `HEAD` commit not recoverable from a currently advertised remote ref, a local tag without a matching advertised remote tag, or an unavailable remote.
+4. Run `git submodule deinit --all`.
+5. Recheck that the root worktree is still clean.
+6. Run `git worktree remove --force` and delete the local branch only after removal succeeds.
+
+An empty administrative directory such as `modules/3rdparty` is safe when no submodule Git repositories or dirty checkouts are present. Warnings about an already-missing `core.worktree` are not sufficient success evidence; require a successful deinit exit, a clean recheck, successful worktree removal, and final path/branch absence.
+
+In `--dry-run` mode, run the same read-only safety audit and report whether deinitialization and force removal would be used. Never manually delete `.git/worktrees/.../modules`.
 
 ## Workflow
 
@@ -49,6 +68,7 @@ If PR lookup fails because `gh` is unavailable or unauthenticated, do not delete
 2. If `git fetch --prune origin` fails due to a GitHub SSH/authentication problem, follow the repo or user `AGENTS.md` instructions for repairing SSH agent state, then retry once.
 3. Read the report and relay:
    - branches/worktrees deleted
+   - submodule cleanup audit, deinitialization, and force-removal actions
    - branches/worktrees kept because they were dirty
    - branches without PRs and their `origin/main` diff summary
    - PR lookup errors, protected branches, detached worktrees, or primary-worktree branches that were intentionally kept
@@ -68,6 +88,7 @@ If PR lookup fails because `gh` is unavailable or unauthenticated, do not delete
 For each local branch/worktree, the report includes the local path if present, PR status, worktree cleanliness, deletion decision, and one focused summary:
 
 - Deleted entries: deletion action and merged PR URL.
+- Submodule entries: whether fallback was required, whether its audit was safe, and how many administrative repositories were checked.
 - Dirty merged PR entries: staged/unstaged/untracked shortstat and sample filenames.
 - No-PR entries: ahead/behind count and shortstat versus `origin/main`.
 - Kept entries: explicit reason such as open PR, closed-unmerged PR, protected branch, detached worktree, PR lookup error, primary worktree, or PR head mismatch.

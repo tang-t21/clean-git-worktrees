@@ -5,7 +5,10 @@ deleting only clean entries whose GitHub pull requests are merged.
 
 The bundled Python script checks protected branches, pull request state, PR
 head SHA, worktree cleanliness, and whether a branch is checked out in the
-primary worktree. It never deletes remote branches.
+primary worktree. When Git refuses to remove a linked worktree because of
+submodule metadata, the script audits recursive submodule dirtiness and remote
+recoverability before deinitializing submodules and using force removal. It
+never deletes remote branches.
 
 ## Install
 

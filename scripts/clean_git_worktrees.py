@@ -29,6 +29,7 @@ PR_FIELDS = ",".join(
 )
 
 PROTECTED_BRANCHES = {"main", "master", "develop", "dev", "trunk"}
+SUBMODULE_WORKTREE_ERROR = "working trees containing submodules cannot be moved or removed"
 
 
 @dataclass
@@ -59,6 +60,7 @@ class Entry:
     dirty: dict[str, Any] | None = None
     pr: dict[str, Any] | None = None
     base_diff: dict[str, Any] | None = None
+    submodule_cleanup: dict[str, Any] | None = None
     decision: str = "kept"
     reason: str = ""
     actions: list[str] = field(default_factory=list)
@@ -201,10 +203,183 @@ def dirty_summary(worktree_path: str, max_files: int) -> tuple[bool, dict[str, A
         "file_count": len(lines),
         "staged_shortstat": clean_shortstat(git(worktree_path, "diff", "--cached", "--shortstat")),
         "unstaged_shortstat": clean_shortstat(git(worktree_path, "diff", "--shortstat")),
-        "untracked": git(worktree_path, "ls-files", "--others", "--exclude-standard")
-        .splitlines()[:max_files],
+        "untracked": git(worktree_path, "ls-files", "--others", "--exclude-standard").splitlines()[:max_files],
     }
     return len(lines) == 0, summary
+
+
+def _git_admin(git_dir: Path, *args: str, check: bool = True) -> str:
+    return run(
+        ["git", f"--git-dir={git_dir}", "--work-tree=/", *args],
+        check=check,
+    ).stdout
+
+
+def _git_admin_ok(git_dir: Path, *args: str) -> bool:
+    return (
+        run(
+            ["git", f"--git-dir={git_dir}", "--work-tree=/", *args],
+            check=False,
+        ).returncode
+        == 0
+    )
+
+
+def _find_submodule_admin_repos(modules_root: Path) -> list[Path]:
+    repos: list[Path] = []
+
+    def visit(path: Path) -> None:
+        if not path.is_dir():
+            return
+        if (path / "HEAD").is_file() and (path / "config").is_file() and (path / "objects").is_dir():
+            repos.append(path)
+            visit(path / "modules")
+            return
+        for child in sorted(path.iterdir()):
+            if child.is_dir():
+                visit(child)
+
+    visit(modules_root)
+    return repos
+
+
+def _parse_refs(output: str) -> list[tuple[str, str]]:
+    refs: list[tuple[str, str]] = []
+    for line in output.splitlines():
+        if not line:
+            continue
+        oid, _, refname = line.partition("\0")
+        if oid and refname:
+            refs.append((oid, refname))
+    return refs
+
+
+def _advertised_refs(admin_repo: Path) -> tuple[dict[str, set[str]], list[str]]:
+    refs: dict[str, set[str]] = {}
+    errors: list[str] = []
+    remotes = [line for line in _git_admin(admin_repo, "remote").splitlines() if line]
+    if not remotes:
+        return refs, ["no configured remote"]
+
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    for remote in remotes:
+        url = _git_admin(admin_repo, "remote", "get-url", remote).strip()
+        proc = run(["git", "ls-remote", "--refs", url], check=False, env=env)
+        if proc.returncode != 0:
+            message = (proc.stderr or proc.stdout).strip()
+            errors.append(f"unable to query remote {remote}: {message}")
+            continue
+        for line in proc.stdout.splitlines():
+            oid, _, refname = line.partition("\t")
+            if oid and refname:
+                refs.setdefault(refname, set()).add(oid)
+    return refs, errors
+
+
+def _commit_recoverable(admin_repo: Path, oid: str, remote_oids: set[str]) -> bool:
+    if oid in remote_oids:
+        return True
+    for remote_oid in remote_oids:
+        peeled = _git_admin(
+            admin_repo,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"{remote_oid}^{{commit}}",
+            check=False,
+        ).strip()
+        if not peeled:
+            continue
+        if _git_admin_ok(admin_repo, "merge-base", "--is-ancestor", oid, peeled):
+            return True
+    return False
+
+
+def _audit_submodule_admin_repo(admin_repo: Path, display_path: str) -> tuple[dict[str, Any], list[str]]:
+    issues: list[str] = []
+    head = _git_admin(admin_repo, "rev-parse", "--verify", "HEAD").strip()
+    refs = _parse_refs(_git_admin(admin_repo, "for-each-ref", "--format=%(objectname)%00%(refname)", "refs"))
+    local_heads = [(oid, refname) for oid, refname in refs if refname.startswith("refs/heads/")]
+    local_tags = [(oid, refname) for oid, refname in refs if refname.startswith("refs/tags/")]
+    unsupported_refs = [
+        refname for _, refname in refs if not refname.startswith(("refs/heads/", "refs/remotes/", "refs/tags/"))
+    ]
+    if unsupported_refs:
+        issues.append(f"{display_path}: unsupported local refs: {', '.join(unsupported_refs)}")
+
+    remote_refs, remote_errors = _advertised_refs(admin_repo)
+    issues.extend(f"{display_path}: {error}" for error in remote_errors)
+    remote_oids = {oid for oids in remote_refs.values() for oid in oids}
+
+    critical_commits = {head, *(oid for oid, _ in local_heads)}
+    for oid in sorted(critical_commits):
+        if not _commit_recoverable(admin_repo, oid, remote_oids):
+            issues.append(f"{display_path}: commit {oid} is not recoverable from an advertised remote ref")
+
+    for oid, refname in local_tags:
+        if oid not in remote_refs.get(refname, set()):
+            issues.append(f"{display_path}: local tag {refname} is not preserved by a matching remote tag")
+
+    return (
+        {
+            "path": display_path,
+            "head": head,
+            "local_head_count": len(local_heads),
+            "local_tag_count": len(local_tags),
+            "advertised_remote_ref_count": len(remote_refs),
+        },
+        issues,
+    )
+
+
+def _audit_submodule_force_removal(worktree_path: str) -> dict[str, Any]:
+    git_dir = Path(git(worktree_path, "rev-parse", "--absolute-git-dir").strip())
+    modules_root = git_dir / "modules"
+    required = modules_root.is_dir() and any(modules_root.iterdir())
+    result: dict[str, Any] = {
+        "required": required,
+        "safe": True,
+        "admin_git_dir": str(git_dir),
+        "admin_repo_count": 0,
+        "repositories": [],
+        "issues": [],
+    }
+
+    root_status = git(worktree_path, "status", "--porcelain=v1", "--untracked-files=all")
+    if root_status:
+        result["issues"].append("root worktree became dirty before submodule cleanup")
+
+    submodule_status = git(
+        worktree_path,
+        "submodule",
+        "foreach",
+        "--quiet",
+        "--recursive",
+        "git status --porcelain=v1 --untracked-files=all",
+    )
+    if submodule_status:
+        samples = "; ".join(submodule_status.splitlines()[:12])
+        result["issues"].append(f"initialized submodule worktree is dirty: {samples}")
+
+    if not required:
+        result["safe"] = not result["issues"]
+        return result
+
+    admin_repos = _find_submodule_admin_repos(modules_root)
+    result["admin_repo_count"] = len(admin_repos)
+    for admin_repo in admin_repos:
+        display_path = str(admin_repo.relative_to(git_dir))
+        try:
+            summary, issues = _audit_submodule_admin_repo(admin_repo, display_path)
+        except (GitError, OSError) as exc:
+            result["issues"].append(f"{display_path}: unable to audit submodule admin repo: {exc}")
+            continue
+        result["repositories"].append(summary)
+        result["issues"].extend(issues)
+
+    result["safe"] = not result["issues"]
+    return result
 
 
 def parse_count_pair(text: str) -> dict[str, int] | None:
@@ -369,9 +544,30 @@ def delete_entry(repo: Path, entry: Entry, dry_run: bool) -> None:
     if branch is None:
         return
 
+    current_tip = git(repo, "rev-parse", f"refs/heads/{branch.name}").strip()
+    if current_tip != branch.tip:
+        entry.errors.append(f"branch tip changed during audit: expected {branch.tip}, found {current_tip}")
+        entry.decision = "delete_failed"
+        return
+
     if dry_run:
         if entry.worktree:
-            entry.actions.append(f"would remove worktree {entry.worktree.path}")
+            try:
+                entry.submodule_cleanup = _audit_submodule_force_removal(entry.worktree.path)
+            except (GitError, OSError) as exc:
+                entry.errors.append(f"unable to audit submodule state: {exc}")
+                entry.decision = "delete_failed"
+                return
+            if entry.submodule_cleanup["required"]:
+                if not entry.submodule_cleanup["safe"]:
+                    entry.reason = "submodule safety check failed"
+                    entry.errors.extend(entry.submodule_cleanup["issues"])
+                    entry.decision = "kept"
+                    return
+                entry.actions.append(f"would deinitialize submodules in {entry.worktree.path}")
+                entry.actions.append(f"would force-remove worktree {entry.worktree.path}")
+            else:
+                entry.actions.append(f"would remove worktree {entry.worktree.path}")
         entry.actions.append(f"would delete local branch {branch.name}")
         entry.decision = "would_delete"
         return
@@ -381,11 +577,42 @@ def delete_entry(repo: Path, entry: Entry, dry_run: bool) -> None:
             git(repo, "worktree", "remove", entry.worktree.path)
             entry.actions.append(f"removed worktree {entry.worktree.path}")
         except GitError as exc:
-            entry.errors.append(str(exc))
-            entry.decision = "delete_failed"
-            return
+            if SUBMODULE_WORKTREE_ERROR not in str(exc):
+                entry.errors.append(str(exc))
+                entry.decision = "delete_failed"
+                return
+            try:
+                entry.submodule_cleanup = _audit_submodule_force_removal(entry.worktree.path)
+            except (GitError, OSError) as audit_exc:
+                entry.errors.append(f"unable to audit submodule state: {audit_exc}")
+                entry.decision = "delete_failed"
+                return
+            if not entry.submodule_cleanup["safe"]:
+                entry.reason = "submodule safety check failed"
+                entry.errors.extend(entry.submodule_cleanup["issues"])
+                entry.decision = "kept"
+                return
+            try:
+                git(entry.worktree.path, "submodule", "deinit", "--all")
+                entry.actions.append(f"deinitialized submodules in {entry.worktree.path}")
+                clean_after_deinit, _ = dirty_summary(entry.worktree.path, 0)
+                if not clean_after_deinit:
+                    entry.errors.append("worktree became dirty after submodule deinitialization")
+                    entry.decision = "delete_failed"
+                    return
+                git(repo, "worktree", "remove", "--force", entry.worktree.path)
+                entry.actions.append(f"force-removed worktree {entry.worktree.path} after safe submodule audit")
+            except GitError as cleanup_exc:
+                entry.errors.append(str(cleanup_exc))
+                entry.decision = "delete_failed"
+                return
 
     try:
+        current_tip = git(repo, "rev-parse", f"refs/heads/{branch.name}").strip()
+        if current_tip != branch.tip:
+            entry.errors.append(f"branch tip changed before deletion: expected {branch.tip}, found {current_tip}")
+            entry.decision = "delete_failed"
+            return
         git(repo, "branch", "-D", branch.name)
         entry.actions.append(f"deleted local branch {branch.name}")
         entry.decision = "deleted"
@@ -461,6 +688,7 @@ def entry_to_dict(entry: Entry) -> dict[str, Any]:
         "dirty": entry.dirty,
         "pr": entry.pr,
         "base_diff": entry.base_diff,
+        "submodule_cleanup": entry.submodule_cleanup,
         "decision": entry.decision,
         "reason": entry.reason,
         "actions": entry.actions,
@@ -561,6 +789,14 @@ def print_human_report(report: dict[str, Any]) -> None:
             print(f"  action: {action}")
         for error in entry.get("errors", []):
             print(f"  error: {error}")
+        submodule_cleanup = entry.get("submodule_cleanup")
+        if submodule_cleanup:
+            print(
+                "  submodule cleanup: "
+                f"required={submodule_cleanup['required']}, "
+                f"safe={submodule_cleanup['safe']}, "
+                f"admin repos={submodule_cleanup['admin_repo_count']}"
+            )
         if entry["decision"] == "kept" and entry.get("clean") is False:
             for line in format_dirty(entry.get("dirty")):
                 print(f"  {line}")
