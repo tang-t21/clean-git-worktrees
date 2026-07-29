@@ -1,14 +1,15 @@
 # Clean Git Worktrees
 
 A Codex skill for auditing local Git branches and linked worktrees, then
-deleting only clean entries whose GitHub pull requests are merged.
+deleting clean entries whose GitHub pull requests are merged or whose no-PR
+branch tips are already fully contained in the configured base.
 
 The bundled Python script checks protected branches, pull request state, PR
-head SHA, worktree cleanliness, and whether a branch is checked out in the
-primary worktree. When Git refuses to remove a linked worktree because of
-submodule metadata, the script audits recursive submodule dirtiness and remote
-recoverability before deinitializing submodules and using force removal. It
-never deletes remote branches.
+head SHA, no-PR branch containment, worktree cleanliness, and whether a branch
+is checked out in the primary worktree. When Git refuses to remove a linked
+worktree because of submodule metadata, the script audits recursive submodule
+dirtiness and remote recoverability before deinitializing submodules and using
+force removal. It never deletes remote branches.
 
 ## Install
 

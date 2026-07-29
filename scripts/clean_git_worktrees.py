@@ -513,6 +513,7 @@ def deletion_decision(
     entry: Entry,
     *,
     protected: set[str],
+    allow_no_pr_deletion: bool,
 ) -> tuple[bool, str]:
     if entry.kind != "branch" or entry.branch is None:
         return False, "not a local branch"
@@ -530,7 +531,15 @@ def deletion_decision(
     if entry.pr.get("status") == "lookup_error":
         return False, "PR lookup error"
     if entry.pr.get("status") == "no_pr":
-        return False, "no GitHub PR"
+        if not allow_no_pr_deletion:
+            return False, "no GitHub PR and base freshness is unverified"
+        base_diff = entry.base_diff or {}
+        counts = base_diff.get("ahead_behind")
+        if not counts:
+            return False, "no GitHub PR and base comparison is unavailable"
+        if counts["ahead"] != 0:
+            return False, "no GitHub PR and branch has commits not in base"
+        return True, f"no GitHub PR and branch tip is contained in {base_diff.get('base')}"
     if entry.pr.get("status") != "merged":
         return False, f"PR is {entry.pr.get('status')}"
     head_ref_oid = entry.pr.get("headRefOid")
@@ -549,6 +558,13 @@ def delete_entry(repo: Path, entry: Entry, dry_run: bool) -> None:
         entry.errors.append(f"branch tip changed during audit: expected {branch.tip}, found {current_tip}")
         entry.decision = "delete_failed"
         return
+
+    if (entry.pr or {}).get("status") == "no_pr":
+        base_ref = (entry.base_diff or {}).get("base")
+        if not base_ref or not git_ok(repo, "merge-base", "--is-ancestor", branch.tip, base_ref):
+            entry.errors.append(f"base {base_ref or '(unavailable)'} no longer contains branch tip {branch.tip}")
+            entry.decision = "delete_failed"
+            return
 
     if dry_run:
         if entry.worktree:
@@ -627,6 +643,7 @@ def build_entries(
     base_ref: str | None,
     max_files: int,
     protected: set[str],
+    allow_no_pr_deletion: bool,
     dry_run: bool,
 ) -> list[Entry]:
     worktrees = parse_worktrees(repo)
@@ -652,7 +669,11 @@ def build_entries(
         if entry.pr.get("status") in {"no_pr", "lookup_error"}:
             entry.base_diff = diff_summary(repo, branch.name, base_ref, max_files)
 
-        can_delete, reason = deletion_decision(entry, protected=protected)
+        can_delete, reason = deletion_decision(
+            entry,
+            protected=protected,
+            allow_no_pr_deletion=allow_no_pr_deletion,
+        )
         entry.reason = reason
         if can_delete:
             delete_entry(repo, entry, dry_run)
@@ -808,7 +829,10 @@ def print_human_report(report: dict[str, Any]) -> None:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Audit local Git branches/worktrees and delete clean branches whose GitHub PRs are merged."
+        description=(
+            "Audit local Git branches/worktrees and delete clean branches whose GitHub PRs are merged "
+            "or whose no-PR tips are already contained in the base."
+        )
     )
     parser.add_argument("repo", help="Path inside the Git repository to audit.")
     parser.add_argument("--base", default="origin/main", help="Base ref for no-PR diff summaries.")
@@ -849,6 +873,7 @@ def main(argv: list[str]) -> int:
         base_ref=base_ref,
         max_files=max(args.max_files, 0),
         protected=protected,
+        allow_no_pr_deletion=not bool(fetch_error),
         dry_run=args.dry_run,
     )
 

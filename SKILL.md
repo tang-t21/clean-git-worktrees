@@ -27,13 +27,18 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/clean-git-worktrees/scripts/clean_gi
 
 ## Policy
 
-Treat a local branch/worktree as auto-deletable only when all of these are true:
+Treat a local branch/worktree as auto-deletable only when all of these common conditions are true:
 
 - The branch is not a protected base branch such as `main`, `master`, `develop`, `dev`, or `trunk`.
-- A GitHub PR for the local branch is found and the PR is merged.
-- The local branch tip matches the merged PR head SHA when GitHub provides it.
 - The associated worktree is clean: no staged changes, unstaged tracked changes, or untracked files.
 - The branch is not detached and is not checked out in the primary worktree.
+
+Also require one of these history conditions:
+
+- A GitHub PR for the local branch is merged, and the local branch tip matches the merged PR head SHA when GitHub provides it.
+- GitHub confirms that no PR exists for the branch, the base comparison succeeds, and the local branch has zero commits ahead of the configured base. This means the complete branch tip is already reachable from the base, even when the branch is behind it.
+
+Keep a no-PR branch when it has any commit not in the base, including an empty commit or a commit whose final tree happens to match the base. Keep it when the fetch failed or the base comparison is unavailable. A PR lookup error is not the same as a confirmed no-PR result.
 
 The script removes local linked worktrees with `git worktree remove` and removes local branches with `git branch -D`. It never deletes remote branches.
 
@@ -41,7 +46,7 @@ If normal removal fails with `working trees containing submodules cannot be move
 
 If a merged PR exists but the worktree is dirty, do not delete. Report the dirty summary from the script.
 
-If no GitHub PR is found, do not delete. Report the script's diff summary against the configured base, defaulting to `origin/main`.
+If no GitHub PR is found and the branch has commits not in the base, do not delete. Report the script's diff summary against the configured base, defaulting to `origin/main`.
 
 If PR lookup fails because `gh` is unavailable or unauthenticated, do not delete. Report the lookup failure and any diff summary available.
 
@@ -70,7 +75,7 @@ In `--dry-run` mode, run the same read-only safety audit and report whether dein
    - branches/worktrees deleted
    - submodule cleanup audit, deinitialization, and force-removal actions
    - branches/worktrees kept because they were dirty
-   - branches without PRs and their `origin/main` diff summary
+   - branches without PRs, their `origin/main` containment decision, and their diff summary
    - PR lookup errors, protected branches, detached worktrees, or primary-worktree branches that were intentionally kept
 4. Do not manually run destructive Git commands outside the script unless the user explicitly asks for a narrower follow-up.
 
@@ -90,5 +95,5 @@ For each local branch/worktree, the report includes the local path if present, P
 - Deleted entries: deletion action and merged PR URL.
 - Submodule entries: whether fallback was required, whether its audit was safe, and how many administrative repositories were checked.
 - Dirty merged PR entries: staged/unstaged/untracked shortstat and sample filenames.
-- No-PR entries: ahead/behind count and shortstat versus `origin/main`.
+- No-PR entries: ahead/behind count and shortstat versus `origin/main`; delete only when `ahead` is zero and the common safety conditions pass.
 - Kept entries: explicit reason such as open PR, closed-unmerged PR, protected branch, detached worktree, PR lookup error, primary worktree, or PR head mismatch.
