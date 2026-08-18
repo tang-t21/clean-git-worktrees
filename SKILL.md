@@ -1,73 +1,44 @@
 ---
 name: clean-git-worktrees
-description: Audit and clean up a Git repository with many local feature branches and linked worktrees. Use when Codex is asked to organize, summarize, prune, delete, or safely clean local Git branches/worktrees by checking working tree cleanliness, GitHub PR merge state, and diffs against origin/main.
+description: List every registered local Git worktree, delete only obvious safe cases, and explain what each retained worktree is doing from its PR, commits, main diff, and dirty files. Use when Codex is asked to audit, review, organize, or clean local Git worktrees.
 ---
 
 # Clean Git Worktrees
 
-## Overview
-
-Use this skill to inspect every local branch and linked worktree in a repo, delete only entries that are safe by policy, and summarize everything else for the user.
-
-The bundled script is the source of truth for the audit and deletion sequence.
-
-## Quick Start
-
-Run:
+Run the bundled script against the requested repository:
 
 ```bash
-python3 "${CODEX_HOME:-$HOME/.codex}/skills/clean-git-worktrees/scripts/clean_git_worktrees.py" /path/to/repo
+python3 /home/tangtian/.codex/skills/clean-git-worktrees/scripts/clean_git_worktrees.py /path/to/repo --json
 ```
 
-Use `--dry-run` when the user asks for preview-only output:
-
-```bash
-python3 "${CODEX_HOME:-$HOME/.codex}/skills/clean-git-worktrees/scripts/clean_git_worktrees.py" /path/to/repo --dry-run
-```
+The default mode performs safe deletions. Add `--dry-run` only when the user asks for a preview.
 
 ## Policy
 
-Treat a local branch/worktree as auto-deletable only when all of these are true:
+Audit only entries from `git worktree list`; do not include standalone local branches.
 
-- The branch is not a protected base branch such as `main`, `master`, `develop`, `dev`, or `trunk`.
-- A GitHub PR for the local branch is found and the PR is merged.
-- The local branch tip matches the merged PR head SHA when GitHub provides it.
-- The associated worktree is clean: no staged changes, unstaged tracked changes, or untracked files.
-- The branch is not detached and is not checked out in the primary worktree.
+For every worktree:
 
-The script removes local linked worktrees with `git worktree remove` and removes local branches with `git branch -D`. It never deletes remote branches.
+1. Fetch `origin` and compare with `origin/main`.
+2. If its branch has an open PR, keep it.
+3. If its PR is merged, delete only when the worktree is clean and its HEAD still matches the merged PR head.
+4. Otherwise, including no PR, closed-unmerged PR, a changed post-merge HEAD, or detached HEAD, inspect commits and files unique to the worktree versus `origin/main`.
+5. Delete only when the worktree is clean and has zero commits ahead of `origin/main`.
+6. Keep dirty worktrees and every worktree with unique commits.
 
-If a merged PR exists but the worktree is dirty, do not delete. Report the dirty summary from the script.
+Always keep the primary worktree, protected base branches, locked worktrees, stale or inaccessible records, and entries whose PR or main comparison failed. A failure for one entry must not stop the remaining audit.
 
-If no GitHub PR is found, do not delete. Report the script's diff summary against the configured base, defaulting to `origin/main`.
+Use only normal `git worktree remove`. If Git refuses removal, keep the worktree for review; do not force-remove or prune metadata. After successfully removing a branch-backed worktree, delete only its matching local branch. Never delete a remote branch.
 
-If PR lookup fails because `gh` is unavailable or unauthenticated, do not delete. Report the lookup failure and any diff summary available.
+## Report
 
-## Workflow
+Return one list containing every worktree seen before deletion. For each item include:
 
-1. Run the script against the repo path the user supplied.
-2. If `git fetch --prune origin` fails due to a GitHub SSH/authentication problem, follow the repo or user `AGENTS.md` instructions for repairing SSH agent state, then retry once.
-3. Read the report and relay:
-   - branches/worktrees deleted
-   - branches/worktrees kept because they were dirty
-   - branches without PRs and their `origin/main` diff summary
-   - PR lookup errors, protected branches, detached worktrees, or primary-worktree branches that were intentionally kept
-4. Do not manually run destructive Git commands outside the script unless the user explicitly asks for a narrower follow-up.
+- path, branch or detached state, and HEAD
+- PR state, title, and URL when present
+- clean, dirty, locked, stale, or inaccessible state
+- deletion action or exact reason it needs review
 
-## Script Options
+For every retained item, describe in one concise sentence what the worktree is doing. Use its PR title when a PR is present, then inspect unique commit subjects, changed files versus `origin/main`, and dirty files for any work not covered by that PR. Do not return only counts or filenames without the purpose summary.
 
-- `--dry-run`: print what would be deleted without deleting.
-- `--base <ref>`: compare no-PR branches against another base ref instead of `origin/main`.
-- `--remote <name>`: fetch another remote instead of `origin`.
-- `--no-fetch`: skip the initial `git fetch --prune`.
-- `--json`: emit machine-readable JSON.
-- `--max-files <n>`: change how many filenames are included in summaries.
-
-## Output Expectations
-
-For each local branch/worktree, the report includes the local path if present, PR status, worktree cleanliness, deletion decision, and one focused summary:
-
-- Deleted entries: deletion action and merged PR URL.
-- Dirty merged PR entries: staged/unstaged/untracked shortstat and sample filenames.
-- No-PR entries: ahead/behind count and shortstat versus `origin/main`.
-- Kept entries: explicit reason such as open PR, closed-unmerged PR, protected branch, detached worktree, PR lookup error, primary worktree, or PR head mismatch.
+Do not perform unrelated branch cleanup, remote deletion, force removal, metadata pruning, process inspection, or artifact cleanup unless the user explicitly asks for it afterward.
