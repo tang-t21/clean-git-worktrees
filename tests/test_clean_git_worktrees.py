@@ -62,6 +62,16 @@ prunable gitdir file points to non-existent location
         run_mock.assert_not_called()
 
 
+class CommandTimeoutTest(unittest.TestCase):
+    def test_timeout_becomes_a_failed_command_result(self) -> None:
+        expired = subprocess.TimeoutExpired(["git", "status"], timeout=0.01)
+        with mock.patch.object(CLEANER.subprocess, "run", side_effect=expired):
+            proc = CLEANER.run(["git", "status"], check=False, timeout=0.01)
+
+        self.assertEqual(proc.returncode, 124)
+        self.assertIn("command timed out after 0.01 seconds", proc.stderr)
+
+
 class DecisionTest(unittest.TestCase):
     def entry(
         self,

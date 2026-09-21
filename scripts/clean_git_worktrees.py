@@ -19,6 +19,7 @@ PR_FIELDS = (
     "number,title,state,mergedAt,url,headRefName,headRefOid,baseRefName,updatedAt"
 )
 REPORT_LIMIT = 20
+COMMAND_TIMEOUT_SECONDS = 60
 SUBMODULE_WORKTREE_ERROR = (
     "working trees containing submodules cannot be moved or removed"
 )
@@ -68,15 +69,27 @@ def run(
     cwd: str | Path | None = None,
     check: bool = True,
     env: dict[str, str] | None = None,
+    timeout: float | None = COMMAND_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess[str]:
-    proc = subprocess.run(
-        cmd,
-        cwd=str(cwd) if cwd is not None else None,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(cwd) if cwd is not None else None,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+        detail = f"command timed out after {timeout:g} seconds: {' '.join(cmd)}"
+        proc = subprocess.CompletedProcess(
+            cmd,
+            124,
+            exc.stdout if isinstance(exc.stdout, str) else "",
+            "\n".join(part for part in (stderr.strip(), detail) if part),
+        )
     if check and proc.returncode != 0:
         raise CommandError(cmd, proc)
     return proc
@@ -696,7 +709,9 @@ def delete_entry(
         return
 
     proc = run(
-        ["git", "-C", str(repo), "worktree", "remove", worktree.path], check=False
+        ["git", "-C", str(repo), "worktree", "remove", worktree.path],
+        check=False,
+        timeout=None,
     )
     if proc.returncode != 0:
         remove_error = "\n".join(
@@ -729,6 +744,7 @@ def delete_entry(
         deinit = run(
             ["git", "-C", worktree.path, "submodule", "deinit", "--all"],
             check=False,
+            timeout=None,
         )
         if deinit.returncode != 0:
             entry.decision = "review"
@@ -762,6 +778,7 @@ def delete_entry(
                 worktree.path,
             ],
             check=False,
+            timeout=None,
         )
         if forced.returncode != 0:
             entry.decision = "review"
