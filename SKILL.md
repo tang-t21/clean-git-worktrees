@@ -28,7 +28,18 @@ For every worktree:
 
 Always keep the primary worktree, protected base branches, locked worktrees, stale or inaccessible records, and entries whose PR or main comparison failed. A failure for one entry must not stop the remaining audit.
 
-Use only normal `git worktree remove`. If Git refuses removal, keep the worktree for review; do not force-remove or prune metadata. After successfully removing a branch-backed worktree, delete only its matching local branch. Never delete a remote branch.
+Use normal `git worktree remove` first. If Git refuses only because the worktree
+contains initialized submodules, continue only after the script verifies that
+the root and every initialized submodule are clean and that every submodule
+HEAD, local branch, and tag is recoverable from an advertised remote ref. The
+script may then deinitialize the submodules, recheck the root HEAD and clean
+state, and use `git worktree remove --force` for that audited worktree. Keep the
+worktree for review if any audit, remote lookup, deinitialization, or final
+removal check fails. Never use force for another removal error and never prune
+worktree metadata.
+
+After successfully removing a branch-backed worktree, delete only its matching
+local branch. Never delete a remote branch.
 
 ## Report
 

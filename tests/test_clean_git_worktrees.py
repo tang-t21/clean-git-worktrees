@@ -62,6 +62,16 @@ prunable gitdir file points to non-existent location
         run_mock.assert_not_called()
 
 
+class CommandTimeoutTest(unittest.TestCase):
+    def test_timeout_becomes_a_failed_command_result(self) -> None:
+        expired = subprocess.TimeoutExpired(["git", "status"], timeout=0.01)
+        with mock.patch.object(CLEANER.subprocess, "run", side_effect=expired):
+            proc = CLEANER.run(["git", "status"], check=False, timeout=0.01)
+
+        self.assertEqual(proc.returncode, 124)
+        self.assertIn("command timed out after 0.01 seconds", proc.stderr)
+
+
 class DecisionTest(unittest.TestCase):
     def entry(
         self,
@@ -221,7 +231,7 @@ class EntryAndDeletionTest(unittest.TestCase):
                 CLEANER.git_ok(repo, "show-ref", "--verify", "refs/heads/absorbed")
             )
 
-    def test_removal_failure_is_reported_for_review_without_force(self) -> None:
+    def test_non_submodule_removal_failure_is_reported_without_force(self) -> None:
         entry = CLEANER.Entry(
             worktree=CLEANER.Worktree(path="/linked", head="a" * 40, branch="topic"),
             clean=True,
@@ -232,7 +242,7 @@ class EntryAndDeletionTest(unittest.TestCase):
             ["git", "worktree", "remove"],
             returncode=1,
             stdout="",
-            stderr="working trees containing submodules cannot be moved or removed",
+            stderr="permission denied",
         )
         with (
             mock.patch.object(
@@ -250,6 +260,264 @@ class EntryAndDeletionTest(unittest.TestCase):
         self.assertIn("removal failed", entry.reason)
         commands = [call.args[0] for call in run_mock.call_args_list]
         self.assertFalse(any("--force" in command for command in commands))
+
+    def test_mixed_removal_error_does_not_trigger_force(self) -> None:
+        entry = CLEANER.Entry(
+            worktree=CLEANER.Worktree(path="/linked", head="a" * 40, branch="topic"),
+            clean=True,
+            pr={"status": "merged", "headRefOid": "a" * 40},
+            decision="delete",
+        )
+        failed = subprocess.CompletedProcess(
+            ["git", "worktree", "remove"],
+            returncode=1,
+            stdout="permission denied",
+            stderr=(
+                "fatal: working trees containing submodules cannot be moved or removed"
+            ),
+        )
+        with (
+            mock.patch.object(
+                CLEANER, "worktree_status", return_value=(True, {"files": []})
+            ),
+            mock.patch.object(CLEANER, "git", return_value="a" * 40),
+            mock.patch.object(CLEANER, "revalidate_history", return_value=True),
+            mock.patch.object(CLEANER, "run", return_value=failed) as run_mock,
+            mock.patch.object(CLEANER, "audit_submodule_force_removal") as audit_mock,
+        ):
+            CLEANER.delete_entry(
+                Path("/repo"), entry, base="origin/main", fetch_ok=True, dry_run=False
+            )
+
+        self.assertEqual(entry.decision, "review")
+        self.assertTrue(any("permission denied" in error for error in entry.errors))
+        audit_mock.assert_not_called()
+        commands = [call.args[0] for call in run_mock.call_args_list]
+        self.assertFalse(any("--force" in command for command in commands))
+
+    def test_force_requires_auditable_submodule_metadata(self) -> None:
+        entry = CLEANER.Entry(
+            worktree=CLEANER.Worktree(path="/linked", head="a" * 40, branch="topic"),
+            clean=True,
+            pr={"status": "merged", "headRefOid": "a" * 40},
+            decision="delete",
+        )
+        failed = subprocess.CompletedProcess(
+            ["git", "worktree", "remove"],
+            returncode=1,
+            stdout="",
+            stderr=(
+                "fatal: working trees containing submodules cannot be moved or removed"
+            ),
+        )
+        incomplete_audit = {
+            "required": False,
+            "safe": True,
+            "admin_repo_count": 0,
+            "initialized_submodule_count": 0,
+            "issues": [],
+        }
+        with (
+            mock.patch.object(
+                CLEANER, "worktree_status", return_value=(True, {"files": []})
+            ),
+            mock.patch.object(CLEANER, "git", return_value="a" * 40),
+            mock.patch.object(CLEANER, "revalidate_history", return_value=True),
+            mock.patch.object(CLEANER, "run", return_value=failed) as run_mock,
+            mock.patch.object(
+                CLEANER,
+                "audit_submodule_force_removal",
+                return_value=incomplete_audit,
+            ),
+        ):
+            CLEANER.delete_entry(
+                Path("/repo"), entry, base="origin/main", fetch_ok=True, dry_run=False
+            )
+
+        self.assertEqual(entry.decision, "review")
+        self.assertTrue(
+            any("without auditable admin metadata" in error for error in entry.errors)
+        )
+        commands = [call.args[0] for call in run_mock.call_args_list]
+        self.assertFalse(any("--force" in command for command in commands))
+
+
+class SubmoduleCleanupTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory(prefix="clean-worktree-test-")
+        self.root = Path(self.tempdir.name)
+        self.subrepo = self.root / "subrepo"
+        self.superrepo = self.root / "superrepo"
+        self.linked = self.root / "linked"
+
+        run_git(self.root, "init", "-q", "-b", "main", str(self.subrepo))
+        run_git(self.subrepo, "config", "user.name", "Test")
+        run_git(self.subrepo, "config", "user.email", "test@example.invalid")
+        run_git(self.subrepo, "commit", "-q", "--allow-empty", "-m", "initial")
+
+        run_git(self.root, "init", "-q", "-b", "main", str(self.superrepo))
+        run_git(self.superrepo, "config", "user.name", "Test")
+        run_git(self.superrepo, "config", "user.email", "test@example.invalid")
+        run_git(self.superrepo, "commit", "-q", "--allow-empty", "-m", "initial")
+        run_git(
+            self.superrepo,
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            str(self.subrepo),
+            "deps/sub",
+        )
+        run_git(self.superrepo, "commit", "-q", "-am", "add submodule")
+        run_git(
+            self.superrepo,
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "absorbed",
+            str(self.linked),
+        )
+        self.head = run_git(self.linked, "rev-parse", "HEAD").strip()
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def initialize_submodule(self) -> Path:
+        run_git(
+            self.linked,
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+            "-q",
+        )
+        return self.linked / "deps" / "sub"
+
+    def entry(self) -> CLEANER.Entry:
+        return CLEANER.Entry(
+            worktree=CLEANER.Worktree(
+                path=str(self.linked), head=self.head, branch="absorbed"
+            ),
+            clean=True,
+            pr={"status": "no_pr"},
+            base_diff={
+                "base": "main",
+                "ahead_behind": {"ahead": 0, "behind": 0},
+            },
+            decision="delete",
+        )
+
+    def test_clean_recoverable_submodule_is_safely_force_removed(self) -> None:
+        self.initialize_submodule()
+        entry = self.entry()
+
+        CLEANER.delete_entry(
+            self.superrepo, entry, base="main", fetch_ok=True, dry_run=False
+        )
+
+        self.assertEqual(entry.decision, "deleted")
+        self.assertFalse(self.linked.exists())
+        self.assertIsNotNone(entry.submodule_cleanup)
+        self.assertTrue(entry.submodule_cleanup["safe"])
+        self.assertTrue(
+            any("force-removed worktree" in action for action in entry.actions)
+        )
+        self.assertFalse(
+            CLEANER.git_ok(
+                self.superrepo,
+                "show-ref",
+                "--verify",
+                "refs/heads/absorbed",
+            )
+        )
+
+    def test_dry_run_reports_submodule_cleanup_without_mutation(self) -> None:
+        self.initialize_submodule()
+        entry = self.entry()
+
+        CLEANER.delete_entry(
+            self.superrepo, entry, base="main", fetch_ok=True, dry_run=True
+        )
+
+        self.assertEqual(entry.decision, "would_delete")
+        self.assertTrue(self.linked.exists())
+        self.assertTrue(
+            any("would force-remove worktree" in action for action in entry.actions)
+        )
+        self.assertTrue(
+            CLEANER.git_ok(
+                self.superrepo,
+                "show-ref",
+                "--verify",
+                "refs/heads/absorbed",
+            )
+        )
+
+    def test_dirty_initialized_submodule_fails_safety_audit(self) -> None:
+        submodule = self.initialize_submodule()
+        (submodule / "untracked.txt").write_text("preserve me\n")
+
+        result = CLEANER.audit_submodule_force_removal(str(self.linked))
+
+        self.assertFalse(result["safe"])
+        self.assertTrue(
+            any(
+                "initialized submodule worktree is dirty" in issue
+                for issue in result["issues"]
+            )
+        )
+
+    def test_local_only_submodule_commit_blocks_worktree_removal(self) -> None:
+        submodule = self.initialize_submodule()
+        expected = run_git(submodule, "rev-parse", "HEAD").strip()
+        run_git(submodule, "config", "user.name", "Test")
+        run_git(submodule, "config", "user.email", "test@example.invalid")
+        run_git(submodule, "checkout", "-q", "-b", "local-only")
+        run_git(submodule, "commit", "-q", "--allow-empty", "-m", "local only")
+        run_git(submodule, "checkout", "-q", "--detach", expected)
+
+        entry = self.entry()
+        CLEANER.delete_entry(
+            self.superrepo, entry, base="main", fetch_ok=True, dry_run=False
+        )
+
+        self.assertEqual(entry.decision, "review")
+        self.assertEqual(entry.reason, "submodule safety check failed")
+        self.assertTrue(self.linked.exists())
+        self.assertTrue(any("not recoverable" in error for error in entry.errors))
+        self.assertTrue(
+            CLEANER.git_ok(
+                self.superrepo,
+                "show-ref",
+                "--verify",
+                "refs/heads/absorbed",
+            )
+        )
+
+    def test_unreachable_submodule_remote_blocks_worktree_removal(self) -> None:
+        submodule = self.initialize_submodule()
+        run_git(
+            submodule,
+            "remote",
+            "set-url",
+            "origin",
+            str(self.root / "missing-remote"),
+        )
+
+        entry = self.entry()
+        CLEANER.delete_entry(
+            self.superrepo, entry, base="main", fetch_ok=True, dry_run=False
+        )
+
+        self.assertEqual(entry.decision, "review")
+        self.assertEqual(entry.reason, "submodule safety check failed")
+        self.assertTrue(self.linked.exists())
+        self.assertTrue(
+            any("unable to query remote origin" in error for error in entry.errors)
+        )
 
 
 class PullRequestClassificationTest(unittest.TestCase):
