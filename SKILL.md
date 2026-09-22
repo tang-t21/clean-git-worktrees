@@ -8,7 +8,7 @@ description: List every registered local Git worktree, delete only obvious safe 
 Run the bundled script against the requested repository:
 
 ```bash
-python3 /home/tangtian/.codex/skills/clean-git-worktrees/scripts/clean_git_worktrees.py /path/to/repo --json
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/clean-git-worktrees/scripts/clean_git_worktrees.py" /path/to/repo --json
 ```
 
 The default mode performs safe deletions. Add `--dry-run` only when the user asks for a preview.
